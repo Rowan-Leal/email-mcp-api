@@ -1,0 +1,9 @@
+{
+  "name": "email-mcp-api",
+  "version": "1.0.0",
+  "dependencies": {
+    "nodemailer": "^6.9.0",
+    "imapflow": "^1.0.0",
+    "mailparser": "^3.7.1"
+  }
+}
