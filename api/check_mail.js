@@ -57,7 +57,7 @@ module.exports = async (req, res) => {
             subject: message.envelope.subject || '无主题',
             from: message.envelope.from?.[0]?.address || '未知发件人',
             date: message.envelope.date,
-            content: (parsed.text || '（无文字正文）').trim().slice(0, 500)
+            content: (parsed.text || '（无文字正文）').trim().slice(0, 3000)
           });
         }
         messages.reverse();
