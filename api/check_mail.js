@@ -1,7 +1,6 @@
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 
-// 单实例并发锁，避免同时发起多个IMAP连接导致熔断/抢邮件
 let isProcessing = false;
 
 module.exports = async (req, res) => {
@@ -12,7 +11,6 @@ module.exports = async (req, res) => {
     return res.status(200).end();
   }
 
-  // 并发拦截：上一次请求未完成时直接返回，避免重复连接IMAP触发限流
   if (isProcessing) {
     return res.status(200).json({
       success: true,
@@ -32,27 +30,28 @@ module.exports = async (req, res) => {
       pass: process.env.QQ_AUTH_CODE
     },
     logger: false,
-    socketTimeout: 10000 // 10秒超时，防止连接卡死占用资源
+    socketTimeout: 10000
   });
 
   try {
     await client.connect();
-    let lock = await client.getMailboxLock('INBOX');
+    const lock = await client.getMailboxLock('INBOX');
     let messages = [];
 
     try {
-      // 1. 检索收件箱里的未读邮件 (unseen)，返回结果为UID
-      let uids = await client.search({ unseen: true });
+      // 不限制unseen；searchAll获取全部邮件UID，按UID倒序拿【最新1封】
+      const allUids = await client.search({ all: true });
+      if (allUids && allUids.length > 0) {
+        // UID降序，取收件箱最新的一条
+        allUids.sort((a, b) => b - a);
+        const latestUid = allUids[0];
 
-      if (uids && uids.length > 0) {
-        // UID按降序排列，确保取到最新的3封
-        uids.sort((a, b) => b - a);
-        let targetUids = uids.slice(0, 3);
-        let range = targetUids.join(',');
-
-        // 2. 拉取并解析邮件（全程仅读取，不标记已读）
-        for await (let message of client.fetch(range, { envelope: true, source: true }, { uid: true })) {
-          let parsed = await simpleParser(message.source);
+        // 读取最新一封
+        for await (const message of client.fetch(latestUid, {
+          envelope: true,
+          source: true
+        }, { uid: true })) {
+          const parsed = await simpleParser(message.source);
           messages.push({
             subject: message.envelope.subject || '无主题',
             from: message.envelope.from?.[0]?.address || '未知发件人',
@@ -60,13 +59,9 @@ module.exports = async (req, res) => {
             content: (parsed.text || '（无文字正文）').trim().slice(0, 3000)
           });
         }
-        messages.reverse();
 
-        // ✅ 全部解析成功后，再统一标记为已读
-        // 只要解析环节出错，就不会执行标记，彻底避免邮件被"吞"
-        if (messages.length > 0) {
-          await client.messageFlagsAdd(range, ['\\Seen'], { uid: true });
-        }
+        // ✅读取解析成功后，强制标记该封为已读
+        await client.messageFlagsAdd(latestUid, ['\\Seen'], { uid: true });
       }
     } finally {
       lock.release();
@@ -74,21 +69,21 @@ module.exports = async (req, res) => {
 
     await client.logout();
 
-    // 3. 如果没有未读邮件，明确告知
     if (messages.length === 0) {
       return res.status(200).json({
         success: true,
         count: 0,
         emails: [],
-        notice: "当前没有收到新的未读邮件（之前的邮件已阅读过，对方尚未回复）。"
+        notice: "收件箱为空，没有任何邮件。"
       });
     }
 
     return res.status(200).json({ success: true, count: messages.length, emails: messages });
+
   } catch (err) {
+    console.error('IMAP ERROR:', err);
     return res.status(500).json({ error: err.message });
   } finally {
-    // 兜底：无论成功失败，都释放锁并关闭连接
     try {
       await client.logout();
     } catch (_) {}
