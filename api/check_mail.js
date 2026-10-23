@@ -11,6 +11,7 @@ module.exports = async (req, res) => {
     return res.status(200).end();
   }
 
+  // 并发控制：单实例避免重复连接IMAP
   if (isProcessing) {
     return res.status(200).json({
       success: true,
@@ -20,6 +21,8 @@ module.exports = async (req, res) => {
     });
   }
   isProcessing = true;
+  // 兜底超时：15秒后强制释放锁，防止函数异常终止导致永久卡死
+  const lockTimer = setTimeout(() => { isProcessing = false; }, 15000);
 
   const client = new ImapFlow({
     host: 'imap.qq.com',
@@ -39,14 +42,16 @@ module.exports = async (req, res) => {
     let messages = [];
 
     try {
-      // 不限制unseen；searchAll获取全部邮件UID，按UID倒序拿【最新1封】
-      const allUids = await client.search({ all: true });
+      // 全程使用UID模式获取所有邮件ID
+      // UID是邮件的唯一固定标识，不会随邮件状态/位置变化而改变
+      const allUids = await client.search({ all: true }, { uid: true });
+      
       if (allUids && allUids.length > 0) {
-        // UID降序，取收件箱最新的一条
+        // UID严格递增，降序排序后第一个就是收件箱最新的邮件
         allUids.sort((a, b) => b - a);
         const latestUid = allUids[0];
 
-        // 读取最新一封
+        // 按UID精准读取邮件内容
         for await (const message of client.fetch(latestUid, {
           envelope: true,
           source: true
@@ -60,7 +65,7 @@ module.exports = async (req, res) => {
           });
         }
 
-        // ✅读取解析成功后，强制标记该封为已读
+        // 按UID精准标记为已读
         await client.messageFlagsAdd(latestUid, ['\\Seen'], { uid: true });
       }
     } finally {
@@ -78,15 +83,22 @@ module.exports = async (req, res) => {
       });
     }
 
-    return res.status(200).json({ success: true, count: messages.length, emails: messages });
+    return res.status(200).json({ 
+      success: true, 
+      count: messages.length, 
+      emails: messages 
+    });
 
   } catch (err) {
     console.error('IMAP ERROR:', err);
     return res.status(500).json({ error: err.message });
   } finally {
+    // 兜底断开连接，忽略断开时的异常
     try {
       await client.logout();
     } catch (_) {}
+    // 清理定时器并释放锁
+    clearTimeout(lockTimer);
     isProcessing = false;
   }
 };
